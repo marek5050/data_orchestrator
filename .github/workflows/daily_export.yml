@@ -1,0 +1,272 @@
+name: Daily MLB Export (Stats + H2H)
+
+# Public orchestrator for the private marek5050/mlb data pipeline.
+#
+# Why this exists: GitHub Actions minutes are free + unlimited on public repos,
+# and billing is charged to the repo that OWNS the run — not to any repo it
+# checks out. So this public repo runs the daily export on free minutes while
+# the actual code stays private (checked out transiently onto the runner via
+# PRIVATE_REPO_PAT, never committed here).
+#
+# Keep the step list below in sync with marek5050/mlb/.github/workflows/daily_export.yml
+# — only the first checkout step differs (it targets the private repo).
+
+on:
+  schedule:
+    # 5am ET (9:00 UTC) and 4pm ET (20:00 UTC), April-October
+    - cron: '0 9 * 4-10 *'
+    - cron: '0 20 * 4-10 *'
+  workflow_dispatch:
+    inputs:
+      hr_seasons:
+        description: 'Override SEASONS for build_hr_features (e.g. "2019,2020,2021,2022,2023,2024,2025" for a full history backfill). Blank = current season only.'
+        required: false
+        default: ''
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout private mlb repo
+        uses: actions/checkout@v5
+        with:
+          repository: marek5050/mlb
+          ref: main
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Cache uv packages
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run daily export
+        env:
+          PROXY_ENABLED: 'true'
+          PROXY_USER: ${{ secrets.PROXY_USER }}
+          PROXY_PASS: ${{ secrets.PROXY_PASS }}
+        run: uv run python scripts/daily_export.py
+
+      - name: Ingest OddsAPI snapshots (last 7 days, idempotent)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        continue-on-error: true
+        run: |
+          # Trailing window catches any backfills missed on prior runs. OddsAPI
+          # snapshots are upserted on (game_pk, bookmaker, market, outcome) so
+          # re-ingesting the same date is a no-op when the data hasn't moved.
+          START=$(date -u -v-7d +%Y-%m-%d 2>/dev/null || date -u -d '7 days ago' +%Y-%m-%d)
+          END=$(date -u +%Y-%m-%d)
+          uv run python scripts/ingest_odds_history.py --start "$START" --end "$END"
+
+      - name: Resolve odds_history.mlb_game_id
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        continue-on-error: true
+        # Backfills unresolved odds_history rows by matching (date, teams)
+        # against historical_games. Required for the closing_h2h_odds view
+        # — rows without mlb_game_id are silently dropped.
+        run: uv run python scripts/resolve_odds_mlb_game_id.py
+
+      - name: Refresh moneyline training data
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        # No freshness check here — that gates training, not extraction.
+        # If OddsAPI lags by a day this step still succeeds; train_and_upload.yml
+        # decides what to do with stale tables.
+        run: uv run python scripts/refresh_moneyline_training_data.py
+              --ingest-statcast --rebuild-feature-caches
+
+      - name: Ingest starting lineup orders (batter_lineup_slot source)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        # Feeds batter_lineup_slot, which build_hr_features propagates into
+        # training_hr.lineup_slot. Must run BEFORE build_hr_features or the
+        # propagation joins a stale source. Incremental + idempotent: only
+        # fetches games with no slot row yet (last ~30d covers late-posting
+        # lineups and any gap from a missed run).
+        run: uv run python scripts/ingest_lineup_orders.py --seasons 2026
+              --since "$(date -u -d '30 days ago' +%F 2>/dev/null || date -u -v-30d +%F)"
+
+      - name: Ingest historical weather (historical_weather source)
+        env:
+          VISUAL_CROSSING_API_KEY: ${{ secrets.VISUAL_CROSSING_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        continue-on-error: true
+        # Feeds historical_weather, which build_hr_features propagates into
+        # training_hr.temp_f/wind/humidity/precip. Must run BEFORE
+        # build_hr_features or those columns stay null. This table has no other
+        # writer — it silently went stale for two months when run only by hand.
+        # --resume makes it incremental + idempotent: only fetches games with no
+        # historical_weather row yet, so steady-state cost is just the new slate.
+        run: uv run python scripts/ingest_historical_weather.py --season 2026 --resume --sleep 0.2
+
+      - name: Refresh Statcast park factors (current season)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        # Feeds park_factors_yearly, which build_hr_features + score_hr_today
+        # consume for park_hr_factor / park_runs_factor / park_xwobacon_factor.
+        # Must run BEFORE build_hr_features. Uses rolling=3 to regress partial
+        # in-season samples — a single-season index at a hitter park (e.g. GABP)
+        # can spike into the 160s early in the year before the 3yr window
+        # anchors it back to reality. This table has no other writer — it
+        # silently went stale until the CIN=163 blowup surfaced it.
+        run: uv run python scripts/ingest_park_factors.py --seasons $(date -u +%Y) --rolling 3
+
+      - name: Refresh HR training data (training_hr + feature caches)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          HR_SEASONS_OVERRIDE: ${{ github.event.inputs.hr_seasons }}
+        # Steady-state: only rebuild the current season. Seasons 2019-<last year>
+        # are frozen (statcast/park/lineup/weather feeders don't change), and every
+        # builder upserts via ON CONFLICT, so historical rows persist untouched from
+        # the prior full backfill. This is what dropped the step from ~1h20m back to
+        # ~40m. To re-backfill history (e.g. after a late feeder correction), run this
+        # workflow via workflow_dispatch with hr_seasons="2019,2020,...,<last year>".
+        run: |
+          export SEASONS="${HR_SEASONS_OVERRIDE:-$(date -u +%Y)}"
+          echo "build_hr_features SEASONS=$SEASONS"
+          uv run python scripts/build_hr_features.py
+
+      - name: Refresh kalshi_player_map
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        continue-on-error: true
+        # Resolves new Kalshi player codes (call-ups, trades) → mlb_player_id
+        # via the players table. hits_prop_log.py + downstream joiners depend
+        # on this map for name-fuzz-free player resolution.
+        run: |
+          if [ -n "${KALSHI_PRIVATE_KEY}" ]; then
+            mkdir -p ~/.kalshi
+            printf '%s' "${KALSHI_PRIVATE_KEY}" > ~/.kalshi/private_key.pem
+            chmod 600 ~/.kalshi/private_key.pem
+          fi
+          uv run python scripts/ingest_kalshi_player_map.py
+
+      - name: Refresh Kalshi scope taxonomy
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+        continue-on-error: true
+        run: |
+          if [ -n "${KALSHI_PRIVATE_KEY}" ]; then
+            mkdir -p ~/.kalshi
+            printf '%s' "${KALSHI_PRIVATE_KEY}" > ~/.kalshi/private_key.pem
+            chmod 600 ~/.kalshi/private_key.pem
+          fi
+          uv run python scripts/refresh_kalshi_scopes.py
+
+      - name: Report freshness (informational, never fails)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        continue-on-error: true
+        run: uv run python scripts/check_moneyline_training_freshness.py || true
+
+      - name: Auth to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Check FLAML retrain schedule (every 5 days)
+        id: retrain_gate
+        run: |
+          # Retrain on days where (UTC epoch day) % 5 == 0. Manual workflow_dispatch always retrains.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_train=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch — retrain enabled."
+          else
+            day=$(( $(date -u +%s) / 86400 ))
+            if [ $(( day % 5 )) -eq 0 ]; then
+              echo "should_train=true" >> "$GITHUB_OUTPUT"
+              echo "Epoch day $day — retrain enabled."
+            else
+              echo "should_train=false" >> "$GITHUB_OUTPUT"
+              echo "Epoch day $day — retrain skipped (next in $(( 5 - day % 5 )) day(s))."
+            fi
+          fi
+
+      - name: Trigger FLAML HR retrain (Cloud Run Job, async)
+        if: steps.retrain_gate.outputs.should_train == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_LOCATION: ${{ secrets.GCP_LOCATION }}
+        run: |
+          gcloud run jobs execute train-hr-automl \
+            --project="$GCP_PROJECT" \
+            --region="$GCP_LOCATION" \
+            --async
+
+      - name: Trigger FLAML Hits retrain (Cloud Run Job, async)
+        if: steps.retrain_gate.outputs.should_train == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_LOCATION: ${{ secrets.GCP_LOCATION }}
+        continue-on-error: true
+        run: |
+          gcloud run jobs execute train-hits-automl \
+            --project="$GCP_PROJECT" \
+            --region="$GCP_LOCATION" \
+            --async
+
+      - name: Trigger FLAML moneyline retrain (Cloud Run Job, async)
+        if: steps.retrain_gate.outputs.should_train == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_LOCATION: ${{ secrets.GCP_LOCATION }}
+        continue-on-error: true
+        run: |
+          gcloud run jobs execute train-moneyline-automl \
+            --project="$GCP_PROJECT" \
+            --region="$GCP_LOCATION" \
+            --async
+
+      # v2 HR-prop shadow retrain: reuse the sweep job in single-cell prod mode
+      # (PROD_RETRAIN=1, 1 task). Trains a0.25/e0.05 with a gap-proof rolling
+      # stage-2 holdout and promotes to the SHADOW tag hr_automl_v2_a025_e05_daily.
+      # The live a025_e05 model is untouched (manual promote only).
+      - name: Trigger FLAML HR v2 shadow retrain (Cloud Run Job, async)
+        if: steps.retrain_gate.outputs.should_train == 'true'
+        env:
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+          GCP_LOCATION: ${{ secrets.GCP_LOCATION }}
+        continue-on-error: true
+        run: |
+          gcloud run jobs execute train-hr-automl-v2-sweep \
+            --project="$GCP_PROJECT" \
+            --region="$GCP_LOCATION" \
+            --tasks 1 \
+            --update-env-vars PROD_RETRAIN=1 \
+            --async
