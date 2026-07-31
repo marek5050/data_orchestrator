@@ -146,10 +146,32 @@ jobs:
         # the prior full backfill. This is what dropped the step from ~1h20m back to
         # ~40m. To re-backfill history (e.g. after a late feeder correction), run this
         # workflow via workflow_dispatch with hr_seasons="2019,2020,...,<last year>".
+        # Ends with Pandera DQ on the rebuilt training_hr slice (see designs/016).
         run: |
           export SEASONS="${HR_SEASONS_OVERRIDE:-$(date -u +%Y)}"
           echo "build_hr_features SEASONS=$SEASONS"
           uv run python scripts/build_hr_features.py
+
+      - name: DQ check training_hr (Pandera)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        # Explicit second gate (also runs inside build_hr_features). Fail the job
+        # if identity/rates break on the rebuilt season. --joins adds grain,
+        # match-rate, starter-side, orphan, and split-merge audits.
+        run: |
+          YEAR="${{ github.event.inputs.hr_seasons }}"
+          if [ -z "$YEAR" ]; then YEAR=$(date -u +%Y); fi
+          # If override is a CSV of seasons, use the earliest year as min-year.
+          MIN_YEAR=$(echo "$YEAR" | tr ',' '\n' | head -1 | tr -d ' ')
+          uv run python scripts/dq_training_hr.py --source db --min-year "$MIN_YEAR" --joins --fail-hard
+
+      - name: Table freshness (critical content + write clocks)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        # Dual-clock lag vs last R-slate ≤ yesterday. See designs/018_table_freshness.md.
+        # Fails the job if critical tables are missing/stale so silent daily drift
+        # cannot ship into train/score.
+        run: uv run python scripts/check_table_freshness.py --fail-hard
 
       - name: Refresh kalshi_player_map
         env:
