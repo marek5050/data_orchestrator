@@ -132,9 +132,14 @@ jobs:
         # idempotent on game_id. This table has no other writer — it silently
         # went ~26d stale (max game_date 2026-07-12) when run only by hand,
         # zeroing L15 for the full 2026-08-07 ump_shadow slate.
+        # Post-ingest probe: exit 1 if max(game_date) lags yesterday by >2d
+        # (same thresholds as table_freshness important tier). continue-on-error
+        # keeps export moving on umpscorecards outages but the step shows red.
         run: |
           YEAR=$(date -u +%Y)
-          uv run python scripts/ingest_umpire_ratings.py --seasons "$YEAR" --season-types R,P
+          uv run python scripts/ingest_umpire_ratings.py \
+            --seasons "$YEAR" --season-types R,P \
+            --max-lag-days 2 --max-write-lag-hours 48
 
       - name: Refresh Statcast park factors (current season)
         env:
