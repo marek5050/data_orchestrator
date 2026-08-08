@@ -121,6 +121,21 @@ jobs:
         # historical_weather row yet, so steady-state cost is just the new slate.
         run: uv run python scripts/ingest_historical_weather.py --season 2026 --resume --sleep 0.2
 
+      - name: Ingest HP umpire scorecards (mlb_umpire_game_ratings)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        continue-on-error: true
+        # Feeds mlb_umpire_game_ratings from umpscorecards.com. score_hits_today
+        # builds L15/L30/L60 hp_ump_* features for the hits ump shadow arm from
+        # this table; training_hits_v1 LEFT JOINs v_hp_umpire_rolling. Upsert is
+        # idempotent on game_id. This table has no other writer — it silently
+        # went ~26d stale (max game_date 2026-07-12) when run only by hand,
+        # zeroing L15 for the full 2026-08-07 ump_shadow slate.
+        run: |
+          YEAR=$(date -u +%Y)
+          uv run python scripts/ingest_umpire_ratings.py --seasons "$YEAR" --season-types R,P
+
       - name: Refresh Statcast park factors (current season)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
